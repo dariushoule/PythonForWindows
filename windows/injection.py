@@ -464,9 +464,9 @@ def perform_setenv_64(process, key, value):
     code += x64.Mov('RDX', x64.mem('[RCX + 8]'))
     code += x64.Mov('RCX', x64.mem('[RCX]'))
     code += x64.Mov('RAX', SetEnvironmentVariableA)
-    code += x64.Sub('RSP', 2 * 8)
+    code += x64.Sub('RSP', 3 * 8)
     code += x64.Call('RAX')
-    code += x64.Add('RSP', 2 * 8)
+    code += x64.Add('RSP', 3 * 8)
     code += x64.Mov('RCX', 'RAX')
     code += x64.Ret()
 
