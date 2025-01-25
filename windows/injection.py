@@ -2,6 +2,10 @@ import struct
 import ctypes
 import os
 import sys
+import tempfile
+import shutil
+import traceback
+from glob import glob
 
 import windows
 import windows.utils as utils
@@ -452,19 +456,120 @@ def find_python_dll_to_inject(target_bitness):
     raise ValueError("Could not find a path for python-dll <{0}>({1}bits)".format(sys.winver, target_bitness))
 
 
+def perform_setenv_64(process, key, value):
+    k32 = [mod for mod in process.peb.modules if mod.name.lower() == 'kernel32.dll'][0]
+    SetEnvironmentVariableA = k32.pe.exports["SetEnvironmentVariableA"]
+
+    code = x64.MultipleInstr()
+    code += x64.Mov('RDX', x64.mem('[RCX + 8]'))
+    code += x64.Mov('RCX', x64.mem('[RCX]'))
+    code += x64.Mov('RAX', SetEnvironmentVariableA)
+    code += x64.Sub('RSP', 2 * 8)
+    code += x64.Call('RAX')
+    code += x64.Add('RSP', 2 * 8)
+    code += x64.Mov('RCX', 'RAX')
+    code += x64.Ret()
+
+    with process.allocated_memory(0x1000) as addr:
+        process.write_qword(addr, addr + 16)
+        process.write_qword(addr + 8, addr + 17 + len(key))
+        process.write_memory(addr + 16, key)
+        process.write_memory(addr + 17 + len(key), value)
+        t = process.execute(code.get_code(), addr)
+        t.wait()
+
+
+def perform_setenv_32(process, key, value):
+    k32 = [mod for mod in process.peb.modules if mod.name.lower() == 'kernel32.dll'][0]
+    SetEnvironmentVariableA = k32.pe.exports["SetEnvironmentVariableA"]
+
+    code = x86.MultipleInstr()
+    code += x86.Mov('EAX', x86.mem('[ESP + 4]'))
+    code += x86.Push(x86.mem('[EAX + 4]'))
+    code += x86.Push(x86.mem('[EAX]'))
+    code += x86.Mov('EAX', SetEnvironmentVariableA)
+    code += x86.Call('EAX')
+    code += x86.Ret()
+
+    with process.allocated_memory(0x1000) as addr:
+        process.write_qword(addr, addr + 8)
+        process.write_qword(addr + 4, addr + 9 + len(key))
+        process.write_memory(addr + 8, key)
+        process.write_memory(addr + 9 + len(key), value)
+        t = process.execute(code.get_code(), addr)
+        t.wait()
+
+
+def mspython_acl_workaround(target, pydll_path, interpreter_dir):
+    """
+    Works around mspython ACL restrictions on mspython interpreters
+    by copying the critical DLLs to a TEMP dir and orienting the interpreter 
+    against that TEMP dir. 
+
+    Nota Bene: mspython supports python >=3.7 (32/64 bits), no python 2.X
+    """
+    try:
+        cache_dir = os.path.join(tempfile.gettempdir(), 'pfw_dllcache')
+        if not os.path.exists(cache_dir):
+            os.mkdir(cache_dir)
+
+        for dll in [os.path.join(interpreter_dir, 'vcruntime140.dll'), pydll_path]:
+            cache_dll_path = os.path.join(cache_dir, os.path.basename(dll))
+            try:
+                # Creates a copy of the DLL without bringing over restrictive ACLs
+                shutil.copyfile(dll, cache_dll_path)
+            except:
+                # If its not writeable good chance these DLLs are just already loaded somewhere
+                pass
+            # Preloading python DLL and vcruntime so they don't get loaded from the path tree with restrictive ACLs
+            load_dll_in_remote_process(target, cache_dll_path)
+
+        for dll in glob(os.path.join(interpreter_dir, 'dlls', '*')):
+            cache_dll_path = os.path.join(cache_dir, os.path.basename(dll))
+            try:
+                # Dynamic lib DLLs with restrictive ACLs copied to unrestricted parent
+                shutil.copyfile(dll, cache_dll_path)
+            except:
+                pass
+        
+        # Point PYTHONHOME to the interpreter dir so non-DLL libs can load
+        # Point PYTHONPATH to the newly created cache directory so DLL libs are loaded from there
+        if target.bitness == 32:
+            perform_setenv_32(target, 'PYTHONHOME', interpreter_dir)
+            perform_setenv_32(target, 'PYTHONPATH', cache_dir)
+        else:
+            perform_setenv_64(target, 'PYTHONHOME', interpreter_dir)
+            perform_setenv_64(target, 'PYTHONPATH', cache_dir)
+    except:
+        print('An error occurred while attempting to bypass mspython ACLs', file=sys.stderr)
+        print(traceback.format_exc(), file=sys.stderr)
+        return None
+    return cache_dir
+
 
 def execute_python_code(process, code):
     # Cache the value ?
     py_dll_name = get_dll_name_from_python_version()
     pydll_path = find_python_dll_to_inject(process.bitness)
-    if sys.version_info.major == 3:
-        # FOr py3, we may have a per-user install.
-        # Meaning that the vcruntime140.dll will not be in the injected process path
-        # Find it & load-it as well, it should be in the same directory as pythonxx.dll
-        vc_runtime_dll = os.path.join(os.path.dirname(pydll_path), "vcruntime140.dll")
-        load_dll_in_remote_process(process, vc_runtime_dll)
-        # Try to inject the vcrunt
-    load_dll_in_remote_process(process, pydll_path)
+    vc_runtime_dll = os.path.join(os.path.dirname(pydll_path), "vcruntime140.dll")
+    try:
+        if sys.version_info.major == 3:
+            # For py3, we may have a per-user install.
+            # Meaning that the vcruntime140.dll will not be in the injected process path
+            # Find it & load-it as well, it should be in the same directory as pythonxx.dll
+            load_dll_in_remote_process(process, vc_runtime_dll)
+        load_dll_in_remote_process(process, pydll_path)
+    except InjectionFailedError:
+        sec_attrs = [t.name for t in windows.current_process.token.security_attributes]
+        if 'WIN://PKG' in sec_attrs or 'WIN://SYSAPPID' in sec_attrs:
+            dbgprint("DLL load failed on an interpreter with restrictive python ACLs, trying mspython workaround", "DLLINJECT")
+            dll_cache_dir = mspython_acl_workaround(process, pydll_path, os.path.dirname(pydll_path))
+            if dll_cache_dir:
+                shellcode, pythoncode = inject_python_command(process, code, py_dll_name)
+                t = process.create_thread(shellcode, pythoncode)
+                return t
+        # re-raise if we can't work around
+        raise
     shellcode, pythoncode = inject_python_command(process, code, py_dll_name)
     t = process.create_thread(shellcode, pythoncode)
     return t
