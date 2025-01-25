@@ -46,10 +46,10 @@ class TestCurrentProcessWithCheckGarbage(object):
         assert windows.winproxy.GetProcAddress(ntdll_base, b"NtCreateFile") == fn_id_iat.value
 
     def test_current_process_pe_exports(self):
-        mods = [m for m in windows.current_process.peb.modules if m.name == "ntdll.dll"]
+        mods = [m for m in windows.current_process.peb.modules if m.name == "kernel32.dll"]
         assert mods, 'Could not find "kernel32.dll" in current process modules'
         k32 = mods[0]
-        get_current_proc_id = k32.pe.exports['NtCreateFile']
+        get_current_proc_id = k32.pe.exports['GetCurrentProcessId']
         k32_base = windows.winproxy.LoadLibraryA(b"kernel32.dll")
         assert windows.winproxy.GetProcAddress(k32_base, b"GetCurrentProcessId") ==  get_current_proc_id
 
